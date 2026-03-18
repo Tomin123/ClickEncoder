@@ -80,41 +80,78 @@ ClickEncoder::ClickEncoder(int8_t A, int8_t B, int8_t BTN, uint8_t stepsPerNotch
 	if (digitalRead(pinB) == pinsActive) {
 		last ^= 1;
 	}
+
 	#if ENC_DECODER == ENC_ISR
 		p_instance = this;
 	#endif
+
 }
 
-	void ClickEncoder::initISR() {
-		#if ENC_DECODER == ENC_ISR
-			attachInterrupt(digitalPinToInterrupt(pinB), &ClickEncoder::isrPinB, ((pinsActive == LOW) ? FALLING : RISING));
-		#endif
-	}
+#if ENC_DECODER == ENC_ISR
+// aktivaci IRQ musim delat az v setup(), ve zvlast metode, protoze pri vzniku objectu jeste neni aktivni interrupt engine v Arduino
+void ClickEncoder::initISR() {
+	attachInterrupt(digitalPinToInterrupt(pinB), &ClickEncoder::isrPinB,
+						 ((pinsActive == LOW) ? FALLING : RISING));
+
+	pinMode(14, OUTPUT);
+	digitalWrite(14, 0);
+
+}
+
+// static ! volana jako ISR !
+// (volana pri falling edge od HW IRQ)
+void IRAM_ATTR ClickEncoder::isrPinB(void) {
+	static int64_t lLastFall=esp_timer_get_time();
+
+	// pri sestupne hrane hodin (pinB encoderu) 
+	// prectu pinA a podle nej je jasno
+	// bud je PRED nebo ZA clock signalem, tedy bude je jeste v log.1, nebo uz v log.0
+
+	int64_t now = esp_timer_get_time();
 	
+	// vse POD cca 2ms je nesmyslne rychle toceni, nebo RUSENI / ZAKMITY -> zahazuji
+	if (now - lLastFall < 2000) {
+		return;
+	}
+	// Čtení pinu 0-31 pomocí registru (velmi rychlé a bezpečné v ISR)
+	//int stav = (GPIO.in >> pin_number) & 0x1;
+	lLastFall = now;
+
+	digitalWrite(14, !digitalRead(14));
+
+	if (digitalRead(p_instance->pinA)) {
+		(p_instance->delta)--;
+	} else {
+		(p_instance->delta)++;
+	}
+}
+#endif
+
+
 // ----------------------------------------------------------------------------
 #ifndef WITHOUT_BUTTON
 
 
 // Depricated.  Use DigitalButton instead
-ClickEncoder::ClickEncoder(int8_t BTN, bool active)
-		  : doubleClickEnabled(true),
-			 buttonHeldEnabled(true),
-			 accelerationEnabled(true),
-			 delta(0),
-			 last(0),
-			 acceleration(0),
-			 button(Open),
-			 steps(1),
-			 analogInput(false),
-			 pinA(-1),
-			 pinB(-1),
-			 pinBTN(BTN),
-			 pinsActive(active) {
-	pinMode_t configType = (pinsActive == LOW) ? INPUT_PULLUP : INPUT;
-	if (pinBTN >= 0) {
-		pinMode(pinBTN, configType);
-	}
-}
+// ClickEncoder::ClickEncoder(int8_t BTN, bool active)
+// 		  : doubleClickEnabled(true),
+// 			 buttonHeldEnabled(true),
+// 			 accelerationEnabled(true),
+// 			 delta(0),
+// 			 last(0),
+// 			 acceleration(0),
+// 			 button(Open),
+// 			 steps(1),
+// 			 analogInput(false),
+// 			 pinA(-1),
+// 			 pinB(-1),
+// 			 pinBTN(BTN),
+// 			 pinsActive(active) {
+// 	pinMode_t configType = (pinsActive == LOW) ? INPUT_PULLUP : INPUT;
+// 	if (pinBTN >= 0) {
+// 		pinMode(pinBTN, configType);
+// 	}
+// }
 
 // ----------------------------------------------------------------------------
 // Constructor for using digital input as a button
@@ -143,20 +180,6 @@ AnalogButton::AnalogButton(int8_t BTN, int16_t rangeLow, int16_t rangeHigh)
 }
 #endif
 
-// static ! volana jako ISR !
-void ClickEncoder::isrPinB(void) {
-	#if ENC_DECODER == ENC_ISR
-		// pri sestupne hrane hodin (pinB encoderu) (jsem nyni volan pri falling edge od HW IRQ)
-		// prectu pinA a podle nej je jasno
-		if (digitalRead(p_instance->pinA)) {
-			p_instance->delta--;
-			lcdBacklightSet(10);
-		} else {
-			p_instance->delta++;
-			lcdBacklightSet(20);
-		}
-	#endif
-}
 
 // ----------------------------------------------------------------------------
 // call this every 1 millisecond via timer ISR
@@ -207,7 +230,7 @@ void ClickEncoder::service(void) {
 			moved = true;
 		}
 #elif ENC_DECODER == ENC_ISR
-		if (delta)					// meni isrPinB()
+		if (delta) // meni isrPinB()
 			moved = true;
 
 #else
@@ -221,6 +244,7 @@ void ClickEncoder::service(void) {
 			}
 		}
 	}
+
 	// handle button
 	//
 #ifndef WITHOUT_BUTTON

@@ -83,8 +83,10 @@ class ClickEncoder {
 
 		void service(void);
 		int16_t getValue(void);
-		static void isrPinB();
-		void initISR();
+		#if ENC_DECODER == ENC_ISR
+			static void IRAM_ATTR isrPinB();
+			void initISR();
+		#endif
 
 #ifndef WITHOUT_BUTTON
 	public:
