@@ -11,7 +11,8 @@
 
 #include "ClickEncoder.h"
 
-#include "main.h"
+#define	klDEBUG_ISR_ROUTINE		true
+#define	knDEBUG_ISR_PIN_NUM		14
 
 // ----------------------------------------------------------------------------
 // Button configuration (values for 1ms timer service calls)
@@ -37,9 +38,55 @@ const int8_t ClickEncoder::table[16]
 const int8_t ClickEncoder::table[16]
 		  __attribute__((__progmem__)) = {0, 1, -1, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, -1, 1, 0};
 	#endif
+#elif ENC_DECODER == ENC_ISR
+	ClickEncoder* p_instance = NULL;
 #endif
+static volatile int16_t posCorrect = 0;
 
-ClickEncoder* p_instance = NULL;
+
+
+
+
+#include "driver/pcnt.h"
+
+const int pulsePin = 4;  // Vstupní signál (pulzy)
+const int ctrlPin = 21;  // Směrový signál (vlevo/vpravo, nahoru/dolů)
+
+void initPCNT() {
+	pcnt_config_t pcnt_config = {};
+	pcnt_config.pulse_gpio_num = pulsePin;
+	pcnt_config.ctrl_gpio_num = ctrlPin;
+	pcnt_config.unit = PCNT_UNIT_0;
+	pcnt_config.channel = PCNT_CHANNEL_0;
+
+	// Co dělat s pulzem na GPIO 4 (vzestupná hrana)
+	pcnt_config.pos_mode = PCNT_COUNT_DIS; 		// Sestupnou hranu ignoruj
+	pcnt_config.neg_mode = PCNT_COUNT_INC;			// Inkrementovat
+
+	// Co dělat, když je na GPIO 21 (Control) určitá úroveň
+	pcnt_config.lctrl_mode = PCNT_MODE_KEEP;	  // Když je LOW, drž směr (přičítej)
+	pcnt_config.hctrl_mode = PCNT_MODE_REVERSE; // Když je HIGH, otoč směr (odečítej)
+	
+	// Limity (16-bitový registr: -32768 až 32767)
+	pcnt_config.counter_h_lim = 32767;
+	pcnt_config.counter_l_lim = -32768;
+
+	pcnt_unit_config(&pcnt_config);
+
+	// Hardwarový filtr proti zákmitům (např. pro mechanické enkodéry)
+	// Hodnota 1000 při 80MHz APB clocku odfiltruje cokoli kratšího než 12.5 us
+	pcnt_set_filter_value(PCNT_UNIT_0, 1000);
+	pcnt_filter_enable(PCNT_UNIT_0);
+
+	// Inicializace a start
+	pcnt_counter_pause(PCNT_UNIT_0);
+	pcnt_counter_clear(PCNT_UNIT_0);
+	pcnt_counter_resume(PCNT_UNIT_0);
+}
+
+
+
+
 // ----------------------------------------------------------------------------
 
 ClickEncoder::ClickEncoder(int8_t A, int8_t B, int8_t BTN, uint8_t stepsPerNotch, bool active)
@@ -84,46 +131,89 @@ ClickEncoder::ClickEncoder(int8_t A, int8_t B, int8_t BTN, uint8_t stepsPerNotch
 	#if ENC_DECODER == ENC_ISR
 		p_instance = this;
 	#endif
-
+	#if klDEBUG_ISR_ROUTINE == true
+		pinMode(knDEBUG_ISR_PIN_NUM, OUTPUT);
+	#endif
 }
 
 #if ENC_DECODER == ENC_ISR
 // aktivaci IRQ musim delat az v setup(), ve zvlast metode, protoze pri vzniku objectu jeste neni aktivni interrupt engine v Arduino
 void ClickEncoder::initISR() {
-	attachInterrupt(digitalPinToInterrupt(pinB), &ClickEncoder::isrPinB,
-						 ((pinsActive == LOW) ? FALLING : RISING));
-
-	pinMode(14, OUTPUT);
-	digitalWrite(14, 0);
-
+	// int od kazde zmeny/hrany
+	attachInterrupt(digitalPinToInterrupt(pinB), &ClickEncoder::isrPinB, CHANGE);
+	initPCNT();
 }
 
 // static ! volana jako ISR !
-// (volana pri falling edge od HW IRQ)
+// (volana pri rise a falling edge od HW pin change)
 void IRAM_ATTR ClickEncoder::isrPinB(void) {
-	static int64_t lLastFall=esp_timer_get_time();
+	static int64_t lLastFall=0;
 
 	// pri sestupne hrane hodin (pinB encoderu) 
 	// prectu pinA a podle nej je jasno
 	// bud je PRED nebo ZA clock signalem, tedy bude je jeste v log.1, nebo uz v log.0
-
-	int64_t now = esp_timer_get_time();
 	
+	volatile bool lData = digitalRead(p_instance->pinA);				// co nejdriv eulozit
+	volatile bool lClock = digitalRead(p_instance->pinB);				// co nejdriv eulozit
+	volatile int64_t now = esp_timer_get_time();
+	
+	#if klDEBUG_ISR_ROUTINE == true
+		digitalWrite(knDEBUG_ISR_PIN_NUM, !digitalRead(knDEBUG_ISR_PIN_NUM));
+	#endif
+	
+	// potrebuji vyrusit dopady pripadneho "ruseni" = prilis kratke pulsy v CLOCK signalu ZAHODIT
+	// HW ale pocita i s nimi, takze musim udelat NASLEDNOU opravu
 	// vse POD cca 2ms je nesmyslne rychle toceni, nebo RUSENI / ZAKMITY -> zahazuji
-	if (now - lLastFall < 2000) {
-		return;
+	
+	// sestupna hrana CLOCK, tedy cas mezi nastupnou a "novou" sestupnou je podezrele kratky
+	// => resi navrat CLOCK do log.1 a hned zakmit do log.0
+	if (!lClock) {									
+		if (now - lLastFall < 2000) {
+			// stav DATA pinu v dobe sestupne CLOCK byl
+			// opravu udelam dle stavu DATA
+			posCorrect = (lData ? +1 : -1);
+
+			// debug
+			#if klDEBUG_ISR_ROUTINE == true
+				for (int x = 0; x < 20; x++) {
+					digitalWrite(knDEBUG_ISR_PIN_NUM, !digitalRead(knDEBUG_ISR_PIN_NUM));
+				}
+			#endif
+		}
+	} else {
+		// nastupna hrana = konec clock pulsu
+		// nekdy se stane, ze CLOCK signal zustane (i ve spravne mezipozici) v log.0
+		// pri dalsim pohybu pak vygeneruje DVA (necele) pulsy, coz dekoder chape jako dva kroky !
+		// mohu zmerit SIRKU v log.0 a pokud je moc dlouha - jeden puls odectu
+		if (now - lLastFall > 200000) {						// delsi nez 200ms
+			posCorrect = (lData ? +1 : -1);
+			// debug
+			#if klDEBUG_ISR_ROUTINE == true
+				for (int x = 0; x < 100; x++) {
+					digitalWrite(knDEBUG_ISR_PIN_NUM, !digitalRead(knDEBUG_ISR_PIN_NUM));
+				}
+			#endif
+		}
+
 	}
 	// Čtení pinu 0-31 pomocí registru (velmi rychlé a bezpečné v ISR)
 	//int stav = (GPIO.in >> pin_number) & 0x1;
 	lLastFall = now;
 
-	digitalWrite(14, !digitalRead(14));
 
-	if (digitalRead(p_instance->pinA)) {
-		(p_instance->delta)--;
-	} else {
-		(p_instance->delta)++;
-	}
+	// // vse POD cca 2ms je nesmyslne rychle toceni, nebo RUSENI / ZAKMITY -> zahazuji
+	// if (now - lLastFall < 2000) {
+	// 	return;
+	// }
+	// // Čtení pinu 0-31 pomocí registru (velmi rychlé a bezpečné v ISR)
+	// //int stav = (GPIO.in >> pin_number) & 0x1;
+	// lLastFall = now;
+
+	// if (digitalRead(p_instance->pinA)) {
+	// 	(p_instance->delta)--;
+	// } else {
+	// 	(p_instance->delta)++;
+	// }
 }
 #endif
 
@@ -230,8 +320,15 @@ void ClickEncoder::service(void) {
 			moved = true;
 		}
 #elif ENC_DECODER == ENC_ISR
-		if (delta) // meni isrPinB()
-			moved = true;
+		/* if (delta) // meni isrPinB()
+			moved = true; */
+		static int16_t oldCounter = 0;
+		int16_t count;
+		pcnt_get_counter_value(PCNT_UNIT_0, &count);
+		delta = (count - oldCounter);
+		delta += posCorrect;									// zapocitam pripadnou opravu
+		oldCounter = count;
+		posCorrect = 0;
 
 #else
 	#error "Error: define ENC_DECODER to ENC_NORMAL or ENC_FLAKY"
