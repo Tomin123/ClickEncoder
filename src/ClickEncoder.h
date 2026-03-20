@@ -84,7 +84,9 @@ class ClickEncoder {
 		void service(void);
 		int16_t getValue(void);
 		#if ENC_DECODER == ENC_ISR
-			static void IRAM_ATTR isrPinB();
+			static void IRAM_ATTR isrPinData();
+			static void IRAM_ATTR isrPinClock();
+			static void IRAM_ATTR encoderDecode();
 			void initISR();
 		#endif
 

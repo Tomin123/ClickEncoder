@@ -10,9 +10,13 @@
 // ----------------------------------------------------------------------------
 
 #include "ClickEncoder.h"
+//#include "driver/pcnt.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-#define	klDEBUG_ISR_ROUTINE		true
+#define	klDEBUG_ISR_ROUTINE		false
 #define	knDEBUG_ISR_PIN_NUM		14
+#define	knDEBUG_ISR_PIN_NUM2		13
 
 // ----------------------------------------------------------------------------
 // Button configuration (values for 1ms timer service calls)
@@ -22,8 +26,10 @@
 // ----------------------------------------------------------------------------
 // Acceleration configuration (for 1000Hz calls to ::service())
 //
-#define ENC_ACCEL_TOP 3072 // max. acceleration: *12 (val >> 8)
-#define ENC_ACCEL_INC 25
+// #define ENC_ACCEL_TOP 3072 // max. acceleration: *12 (val >> 8)
+// #define ENC_ACCEL_INC 25
+#define ENC_ACCEL_TOP 2000	 // max. acceleration: *12 (val >> 8)
+#define ENC_ACCEL_INC 20
 #define ENC_ACCEL_DEC 2
 
 // ----------------------------------------------------------------------------
@@ -40,49 +46,15 @@ const int8_t ClickEncoder::table[16]
 	#endif
 #elif ENC_DECODER == ENC_ISR
 	ClickEncoder* p_instance = NULL;
+	static volatile int64_t liTmrClockFall=-1;
+	static volatile int64_t liTmrClockRise=-1;
+	static volatile int64_t liTmrDataFall=-1;
+	static volatile int64_t liTmrDataRise=-1;
 #endif
 static volatile int16_t posCorrect = 0;
 
 
 
-
-
-#include "driver/pcnt.h"
-
-const int pulsePin = 4;  // Vstupní signál (pulzy)
-const int ctrlPin = 21;  // Směrový signál (vlevo/vpravo, nahoru/dolů)
-
-void initPCNT() {
-	pcnt_config_t pcnt_config = {};
-	pcnt_config.pulse_gpio_num = pulsePin;
-	pcnt_config.ctrl_gpio_num = ctrlPin;
-	pcnt_config.unit = PCNT_UNIT_0;
-	pcnt_config.channel = PCNT_CHANNEL_0;
-
-	// Co dělat s pulzem na GPIO 4 (vzestupná hrana)
-	pcnt_config.pos_mode = PCNT_COUNT_DIS; 		// Sestupnou hranu ignoruj
-	pcnt_config.neg_mode = PCNT_COUNT_INC;			// Inkrementovat
-
-	// Co dělat, když je na GPIO 21 (Control) určitá úroveň
-	pcnt_config.lctrl_mode = PCNT_MODE_KEEP;	  // Když je LOW, drž směr (přičítej)
-	pcnt_config.hctrl_mode = PCNT_MODE_REVERSE; // Když je HIGH, otoč směr (odečítej)
-	
-	// Limity (16-bitový registr: -32768 až 32767)
-	pcnt_config.counter_h_lim = 32767;
-	pcnt_config.counter_l_lim = -32768;
-
-	pcnt_unit_config(&pcnt_config);
-
-	// Hardwarový filtr proti zákmitům (např. pro mechanické enkodéry)
-	// Hodnota 1000 při 80MHz APB clocku odfiltruje cokoli kratšího než 12.5 us
-	pcnt_set_filter_value(PCNT_UNIT_0, 1000);
-	pcnt_filter_enable(PCNT_UNIT_0);
-
-	// Inicializace a start
-	pcnt_counter_pause(PCNT_UNIT_0);
-	pcnt_counter_clear(PCNT_UNIT_0);
-	pcnt_counter_resume(PCNT_UNIT_0);
-}
 
 
 
@@ -133,6 +105,7 @@ ClickEncoder::ClickEncoder(int8_t A, int8_t B, int8_t BTN, uint8_t stepsPerNotch
 	#endif
 	#if klDEBUG_ISR_ROUTINE == true
 		pinMode(knDEBUG_ISR_PIN_NUM, OUTPUT);
+		pinMode(knDEBUG_ISR_PIN_NUM2, OUTPUT);
 	#endif
 }
 
@@ -140,10 +113,241 @@ ClickEncoder::ClickEncoder(int8_t A, int8_t B, int8_t BTN, uint8_t stepsPerNotch
 // aktivaci IRQ musim delat az v setup(), ve zvlast metode, protoze pri vzniku objectu jeste neni aktivni interrupt engine v Arduino
 void ClickEncoder::initISR() {
 	// int od kazde zmeny/hrany
-	attachInterrupt(digitalPinToInterrupt(pinB), &ClickEncoder::isrPinB, CHANGE);
-	initPCNT();
+	attachInterrupt(digitalPinToInterrupt(pinA), &ClickEncoder::isrPinData, CHANGE);
+	attachInterrupt(digitalPinToInterrupt(pinB), &ClickEncoder::isrPinClock, CHANGE);
+	// initPCNT();
 }
 
+
+// otestuje casy signalu a pokud jsou validni, meni hodnotu prom. "delta" obj.
+// pokud neni prubeh konzistentni, ZAHODI jej cely (nuluje vsechny 4 casy)
+void IRAM_ATTR ClickEncoder::encoderDecode() {
+	// pattern pro LEVY krok je:
+	// clock: --\__/----
+	// data : ----\__/--
+
+	// pattern pro PRAVY krok je:
+	// clock: ----\__/--
+	// data : --\__/----
+
+	// vsechny 4 casy musi byt validni
+	if ((liTmrClockRise != -1)
+		&&
+		(liTmrClockFall != -1)
+		&&
+		(liTmrDataFall != -1)
+		&&
+		(liTmrDataRise != -1)) {
+
+		// sekce kde menim DELTA prom. !!!
+		//------------------------------
+		if ((liTmrDataFall > liTmrClockFall) && (liTmrDataRise > liTmrClockRise)) {
+			(p_instance->delta)--;
+			
+		} else if ((liTmrDataFall < liTmrClockFall) && (liTmrDataRise < liTmrClockRise)) {
+			(p_instance->delta)++;
+			
+		} else {
+			// pokud je signal nekonzistentni (data nejsou casove "prelozena" pres clock)
+			// nekonzistent !
+		}
+		//------------------------------
+
+	} else {
+		// signalizace/DEBUG ktere casy chybi
+		#if klDEBUG_ISR_ROUTINE == true
+			int mul=0;
+			if (liTmrClockRise == -1)
+				mul+= 2;
+			if (liTmrClockFall == -1)
+				mul+= 4;
+			if (liTmrDataFall == -1)
+				mul+= 8;
+			if (liTmrDataRise == -1)
+				mul+= 16;
+
+			for (int x = 0; x < mul; x++) {
+				digitalWrite(knDEBUG_ISR_PIN_NUM2, !digitalRead(knDEBUG_ISR_PIN_NUM2));
+			}
+		#endif
+	}
+	
+	// reset casu
+	liTmrDataFall = liTmrClockFall = liTmrDataRise = liTmrClockRise = -1;
+
+}
+
+void IRAM_ATTR ClickEncoder::isrPinData(void) {
+	static volatile int64_t tmrRise=-1, tmrFall=-1;
+
+	volatile bool lData = digitalRead(p_instance->pinA);				// co nejdriv eulozit
+	volatile bool lClock = digitalRead(p_instance->pinB);				// co nejdriv eulozit
+	volatile int64_t now = esp_timer_get_time();
+
+	if (lData) {
+		#if klDEBUG_ISR_ROUTINE == true
+			digitalWrite(knDEBUG_ISR_PIN_NUM2, 1);
+		#endif
+		tmrRise = now;
+		liTmrDataRise = tmrRise;
+		liTmrDataFall = tmrFall;
+
+		if (lClock) {								// data+clock v idle
+			encoderDecode();
+		}
+	} else {
+		#if klDEBUG_ISR_ROUTINE == true
+			digitalWrite(knDEBUG_ISR_PIN_NUM2, 0);
+		#endif
+	
+		// uz nejaky byl zachycen a tento ted prichazi velmi brzy po rise ?
+		if ((tmrFall!=-1) && (tmrRise!=1) && (now - tmrRise < 2000)) {
+			// NEprepisuji tmrFall - necham ten starsi
+		} else {
+			tmrFall = now;
+		}
+
+	}
+}
+
+
+// volana pri rise a falling edge od HW pin change
+// static ! volana jako ISR !
+void IRAM_ATTR ClickEncoder::isrPinClock(void) {
+	// pro filtr zakmitu
+	static volatile int64_t tmrRise=-1, tmrFall=-1;
+
+	volatile bool lData = digitalRead(p_instance->pinA);				// co nejdriv eulozit
+	volatile bool lClock = digitalRead(p_instance->pinB);				// co nejdriv eulozit
+	volatile int64_t now = esp_timer_get_time();
+	// Čtení pinu 0-31 pomocí registru (velmi rychlé a bezpečné v ISR)
+	//int stav = (GPIO.in >> pin_number) & 0x1;
+
+	
+	if (lClock) {
+		#if klDEBUG_ISR_ROUTINE == true
+			digitalWrite(knDEBUG_ISR_PIN_NUM, 1);
+		#endif
+		tmrRise = now;
+		liTmrClockRise = tmrRise;
+		liTmrClockFall = tmrFall;
+
+		if (lData) {								// data+clock v idle
+			// presunu casy do global. vars
+			encoderDecode();
+		}
+				
+	} else {
+		#if klDEBUG_ISR_ROUTINE == true
+			digitalWrite(knDEBUG_ISR_PIN_NUM, 0);
+		#endif
+
+		// uz nejaky byl zachycen a tento ted prichazi velmi brzy po rise ?
+		if ((tmrFall!=-1) && (tmrRise!=1) && (now - tmrRise < 2000)) {
+			// NEprepisuji tmrFall - necham ten starsi
+		} else {
+			tmrFall = now;
+		}
+
+	}
+
+}
+#endif
+
+/* 
+// volana pri rise a falling edge od HW pin change
+// static ! volana jako ISR !
+void IRAM_ATTR ClickEncoder::isrPinClock(void) {
+
+	// pri sestupne hrane hodin (pinB encoderu) 
+	// prectu pinA a podle nej je jasno
+	// bud je PRED nebo ZA clock signalem, tedy bude je jeste v log.1, nebo uz v log.0
+	
+	volatile bool lData = digitalRead(p_instance->pinA);				// co nejdriv eulozit
+	volatile bool lClock = digitalRead(p_instance->pinB);				// co nejdriv eulozit
+	volatile int64_t now = esp_timer_get_time();
+	// Čtení pinu 0-31 pomocí registru (velmi rychlé a bezpečné v ISR)
+	//int stav = (GPIO.in >> pin_number) & 0x1;
+
+	#if klDEBUG_ISR_ROUTINE == true
+		digitalWrite(knDEBUG_ISR_PIN_NUM, !digitalRead(knDEBUG_ISR_PIN_NUM));
+	#endif
+	
+	// potrebuji vyrusit dopady pripadneho "ruseni" = prilis kratke pulsy v CLOCK signalu ZAHODIT
+	// HW ale pocita i s nimi, takze musim udelat NASLEDNOU opravu
+	// vse POD cca 2ms je nesmyslne rychle toceni, nebo RUSENI / ZAKMITY -> zahazuji
+	
+	// sestupna hrana CLOCK, tedy cas mezi nastupnou a "novou" sestupnou je podezrele kratky
+	// => resi navrat CLOCK do log.1 a hned zakmit do log.0
+	if (!lClock) {									
+		if (now - liTmrClockFall < 2000) {
+			// vse POD cca 2ms je nesmyslne rychle toceni, nebo RUSENI / ZAKMITY -> zahazuji
+			// debug
+			#if klDEBUG_ISR_ROUTINE == true
+			for (int x = 0; x < 20; x++) {
+				digitalWrite(knDEBUG_ISR_PIN_NUM, !digitalRead(knDEBUG_ISR_PIN_NUM));
+			}
+			#endif
+			//-------
+			return;
+			//-------
+		}
+		// Čtení pinu 0-31 pomocí registru (velmi rychlé a bezpečné v ISR)
+		//int stav = (GPIO.in >> pin_number) & 0x1;
+		liTmrClockFall = now;
+	} else {
+		liTmrClockRise = now;
+	}
+
+	if (lData) {
+		(p_instance->delta)--;
+	} else {
+		(p_instance->delta)++;
+	}
+}
+#endif
+ */
+
+
+// verze s HW PCNT modulem
+
+
+// hw PCNT funguje ok, ale stejne musime delat filtry pak v sw ... nema smysl
+/* void initPCNT() {
+	const int pulsePin = 4;  // Vstupní signál (pulzy)
+	const int ctrlPin = 21;  // Směrový signál (vlevo/vpravo, nahoru/dolů)
+	pcnt_config_t pcnt_config = {};
+	pcnt_config.pulse_gpio_num = pulsePin;
+	pcnt_config.ctrl_gpio_num = ctrlPin;
+	pcnt_config.unit = PCNT_UNIT_0;
+	pcnt_config.channel = PCNT_CHANNEL_0;
+
+	// Co dělat s pulzem na GPIO 4 (vzestupná hrana)
+	pcnt_config.pos_mode = PCNT_COUNT_DIS; 		// Sestupnou hranu ignoruj
+	pcnt_config.neg_mode = PCNT_COUNT_INC;			// Inkrementovat
+
+	// Co dělat, když je na GPIO 21 (Control) určitá úroveň
+	pcnt_config.lctrl_mode = PCNT_MODE_KEEP;	  // Když je LOW, drž směr (přičítej)
+	pcnt_config.hctrl_mode = PCNT_MODE_REVERSE; // Když je HIGH, otoč směr (odečítej)
+	
+	// Limity (16-bitový registr: -32768 až 32767)
+	pcnt_config.counter_h_lim = 32767;
+	pcnt_config.counter_l_lim = -32768;
+
+	pcnt_unit_config(&pcnt_config);
+
+	// Hardwarový filtr proti zákmitům (např. pro mechanické enkodéry)
+	// Hodnota 1000 při 80MHz APB clocku odfiltruje cokoli kratšího než 12.5 us
+	pcnt_set_filter_value(PCNT_UNIT_0, 1000);
+	pcnt_filter_enable(PCNT_UNIT_0);
+
+	// Inicializace a start
+	pcnt_counter_pause(PCNT_UNIT_0);
+	pcnt_counter_clear(PCNT_UNIT_0);
+	pcnt_counter_resume(PCNT_UNIT_0);
+} */
+
+/* 
 // static ! volana jako ISR !
 // (volana pri rise a falling edge od HW pin change)
 void IRAM_ATTR ClickEncoder::isrPinB(void) {
@@ -155,6 +359,9 @@ void IRAM_ATTR ClickEncoder::isrPinB(void) {
 	
 	volatile bool lData = digitalRead(p_instance->pinA);				// co nejdriv eulozit
 	volatile bool lClock = digitalRead(p_instance->pinB);				// co nejdriv eulozit
+	// Čtení pinu 0-31 pomocí registru (velmi rychlé a bezpečné v ISR)
+	//int stav = (GPIO.in >> pin_number) & 0x1;
+
 	volatile int64_t now = esp_timer_get_time();
 	
 	#if klDEBUG_ISR_ROUTINE == true
@@ -168,6 +375,7 @@ void IRAM_ATTR ClickEncoder::isrPinB(void) {
 	// sestupna hrana CLOCK, tedy cas mezi nastupnou a "novou" sestupnou je podezrele kratky
 	// => resi navrat CLOCK do log.1 a hned zakmit do log.0
 	if (!lClock) {									
+		lLastFall = now;
 		if (now - lLastFall < 2000) {
 			// stav DATA pinu v dobe sestupne CLOCK byl
 			// opravu udelam dle stavu DATA
@@ -196,9 +404,6 @@ void IRAM_ATTR ClickEncoder::isrPinB(void) {
 		}
 
 	}
-	// Čtení pinu 0-31 pomocí registru (velmi rychlé a bezpečné v ISR)
-	//int stav = (GPIO.in >> pin_number) & 0x1;
-	lLastFall = now;
 
 
 	// // vse POD cca 2ms je nesmyslne rychle toceni, nebo RUSENI / ZAKMITY -> zahazuji
@@ -215,7 +420,7 @@ void IRAM_ATTR ClickEncoder::isrPinB(void) {
 	// 	(p_instance->delta)++;
 	// }
 }
-#endif
+*/
 
 
 // ----------------------------------------------------------------------------
@@ -320,15 +525,16 @@ void ClickEncoder::service(void) {
 			moved = true;
 		}
 #elif ENC_DECODER == ENC_ISR
-		/* if (delta) // meni isrPinB()
-			moved = true; */
-		static int16_t oldCounter = 0;
+		if (delta) // meni isrPinB()
+			moved = true;
+		
+		/* 	static int16_t oldCounter = 0;
 		int16_t count;
 		pcnt_get_counter_value(PCNT_UNIT_0, &count);
 		delta = (count - oldCounter);
 		delta += posCorrect;									// zapocitam pripadnou opravu
 		oldCounter = count;
-		posCorrect = 0;
+		posCorrect = 0; */
 
 #else
 	#error "Error: define ENC_DECODER to ENC_NORMAL or ENC_FLAKY"
@@ -398,6 +604,7 @@ void ClickEncoder::service(void) {
 #endif // WITHOUT_BUTTON
 }
 
+
 // ----------------------------------------------------------------------------
 
 int16_t ClickEncoder::getValue(void) {
@@ -459,3 +666,26 @@ bool ClickEncoder::getPinState() {
 }
 
 #endif
+
+
+
+		// if ((tmrRise!=-1) && (now - tmrRise < 2000)) {
+		// 	// zahazuji, ruseni
+		// 	#if klDEBUG_ISR_ROUTINE == true
+		// 	for (int x = 0; x < 50; x++) {
+		// 		digitalWrite(knDEBUG_ISR_PIN_NUM2, !digitalRead(knDEBUG_ISR_PIN_NUM2));
+		// 	}
+		// 	#endif
+		// } else {
+		// }
+
+				// idle pozice
+		// filtrace moc kratkych pulsu
+		// if ((tmrFall!=-1) && (now - tmrFall < 2000)) {
+		// 	// zahazuji, ruseni
+		// 	#if klDEBUG_ISR_ROUTINE == true
+		// 		for (int x = 0; x < 50; x++) {
+		// 			digitalWrite(knDEBUG_ISR_PIN_NUM2, !digitalRead(knDEBUG_ISR_PIN_NUM2));
+		// 		}
+		// 	#endif
+		// } else {
